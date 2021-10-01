@@ -265,7 +265,7 @@ LIBWDI_EXP int LIBWDI_API wdi_prepare_driver(struct wdi_device_info* device_info
  * Sign a specific inf file
  */
 LIBWDI_EXP int LIBWDI_API wdi_sign_driver_inf(struct wdi_device_info* device_info, const char* path,
-								  const char* inf_name, struct wdi_options_prepare_driver* options);
+								  const char* inf_input_name, struct wdi_options_prepare_driver* options);
 
 /*
  * Install a driver for a specific device
