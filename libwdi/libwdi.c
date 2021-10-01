@@ -1467,6 +1467,387 @@ out:
 	return r;
 }
 
+// Create an inf and extract coinstallers in the directory pointed by path
+int LIBWDI_API wdi_sign_driver_inf(struct wdi_device_info* device_info, const char* path,
+								  const char* inf_input_name, struct wdi_options_prepare_driver* options)
+{
+	const wchar_t bom = 0xFEFF;
+#if defined(ENABLE_DEBUG_LOGGING) || defined(INCLUDE_DEBUG_LOGGING)
+	const char* driver_display_name[WDI_NB_DRIVERS] = { "WinUSB", "libusb0.sys", "libusbK.sys", "Generic USB CDC", "user driver" };
+#endif
+	const char* inf_ext = ".inf";
+	const char* vendor_name = NULL;
+	const char* inf_name = NULL;
+	const char* cat_list[CAT_LIST_MAX_ENTRIES+1];
+	char drv_path[MAX_PATH], inf_path[MAX_PATH], cat_path[MAX_PATH], hw_id[40], cert_subject[64];
+	char *strguid, *token, *cat_name = NULL, *dst = NULL, *cat_in_copy = NULL;
+	wchar_t *wdst = NULL;
+	int i, nb_entries, driver_type = WDI_WINUSB, r = WDI_ERROR_OTHER;
+	long inf_file_size, cat_file_size;
+	BOOL is_android_device = FALSE, is_test_signing_enabled = FALSE;
+	FILE* fd;
+	GUID guid;
+	SYSTEMTIME system_time;
+	FILETIME file_time, local_time;
+	SYSTEM_CODEINTEGRITY_INFORMATION sci = { 0 };
+	ULONG dwcbSz = 0;
+
+	MUTEX_START;
+
+	GET_WINDOWS_VERSION;
+	if (nWindowsVersion < WINDOWS_7) {
+		wdi_err("This version of Windows is no longer supported");
+		r = WDI_ERROR_NOT_SUPPORTED;
+		goto out;
+	}
+	if (nWindowsVersion >= WINDOWS_11) {
+		wdi_err("This version of Windows is not supported");
+		r = WDI_ERROR_NOT_SUPPORTED;
+		goto out;
+	}
+
+	if ((device_info == NULL) || (inf_input_name == NULL)) {
+		wdi_err("One of the required parameter is NULL");
+		r = WDI_ERROR_INVALID_PARAM;
+		goto out;
+	}
+
+	// extract the inf name, that is, leave out the directory, if there is any
+	// ("basename")
+	inf_name = strrchr(inf_input_name, '\\');
+	if (inf_name == NULL) {
+		inf_name = inf_input_name;
+	}
+	else {
+		++inf_name;
+	}
+
+	// Check the inf file provided and create the cat file name
+	if (strcmp(inf_name+safe_strlen(inf_name)-4, inf_ext) != 0) {
+		wdi_err("Inf name provided must have a '.inf' extension");
+		r = WDI_ERROR_INVALID_PARAM;
+		goto out;
+	}
+
+	if (path != NULL) {
+		static_strcpy(drv_path, path);
+	} else {
+		// Try to use the user's temp dir
+		char* tmp = getenvU("TEMP");
+		if (tmp == NULL) {
+			wdi_err("No path provided and unable to use TEMP");
+			r = WDI_ERROR_INVALID_PARAM;
+			goto out;
+		} else {
+			static_strcpy(drv_path, tmp);
+			free(tmp);
+			wdi_info("No path provided - extracting to '%s'", drv_path);
+		}
+	}
+
+	// Try to create directory if it doesn't exist
+	r = check_dir(drv_path, TRUE);
+	if (r != WDI_SUCCESS) {
+		goto out;
+	}
+
+	if (options != NULL) {
+		driver_type = options->driver_type;
+	}
+
+	// Ensure driver_type is what we expect
+	if ( (driver_type < 0) || (driver_type > WDI_USER) ) {
+		wdi_err("Program assertion failed - Unknown driver type");
+		r = WDI_ERROR_INVALID_PARAM;
+		goto out;
+	}
+
+	if (!wdi_is_driver_supported(driver_type, &driver_version[driver_type])) {
+		for (driver_type=0; driver_type<WDI_NB_DRIVERS; driver_type++) {
+			if (wdi_is_driver_supported(driver_type, NULL)) {
+				wdi_warn("unsupported or no driver type specified, will use %s",
+					driver_display_name[driver_type]);
+				break;
+			}
+		}
+		if (driver_type == WDI_NB_DRIVERS) {
+			wdi_warn("Program assertion failed - no driver supported");
+			r = WDI_ERROR_NOT_FOUND;
+			goto out;
+		}
+	}
+
+	// If the target is libusb-win32 and we have the K DLLs, add them to the inf
+	if ((driver_type == WDI_LIBUSB0) && (wdi_is_driver_supported(WDI_LIBUSBK, NULL))) {
+		wdi_info("K driver available - adding the libusbK DLLs to the libusb-win32 inf");
+		static_strcpy(inf_entities[LK_COMMA].replace, ",");
+		static_strcpy(inf_entities[LK_DLL].replace, "libusbk.dll");
+		static_strcpy(inf_entities[LK_X86_DLL].replace, "libusbk_x86.dll");
+		static_strcpy(inf_entities[LK_EQ_X86].replace, "= 1,x86");
+		static_strcpy(inf_entities[LK_EQ_X64].replace, "= 1,amd64");
+	}
+
+	// For custom drivers, as we cannot autogenerate the inf, simply extract binaries
+	if (driver_type == WDI_USER) {
+		wdi_info("Custom driver - extracting binaries only (no inf/cat creation)");
+		r = extract_binaries(drv_path);
+		goto out;
+	}
+
+	if (device_info->desc == NULL) {
+		wdi_err("No device ID was given for the device - aborting");
+		r = WDI_ERROR_INVALID_PARAM;
+		goto out;
+	}
+
+	r = extract_binaries(drv_path);
+	if (r != WDI_SUCCESS) {
+		goto out;
+	}
+
+	// Populate the inf and cat names & paths
+	if ( (strlen(drv_path) >= MAX_PATH) || (strlen(inf_name) >= MAX_PATH) ||
+		 ((strlen(drv_path) + strlen(inf_name)) > (MAX_PATH - 2)) ) {
+		wdi_err("Qualified path for inf file is too long: '%s\\%s", drv_path, inf_name);
+		r = WDI_ERROR_RESOURCE;
+		goto out;
+	}
+	safe_strcpy(inf_path, sizeof(inf_path), drv_path);
+	safe_strcat(inf_path, sizeof(inf_path), "\\");
+	safe_strcat(inf_path, sizeof(inf_path), inf_name);
+	safe_strcpy(cat_path, sizeof(cat_path), inf_path);
+	if (safe_strlen(cat_path) < 4) {
+		wdi_err("Qualified path for inf file is too short: '%s", cat_path);
+		r = WDI_ERROR_RESOURCE;
+		goto out;
+	}
+	cat_path[safe_strlen(cat_path)-3] = 'c';
+	cat_path[safe_strlen(cat_path)-2] = 'a';
+	cat_path[safe_strlen(cat_path)-1] = 't';
+
+	// copy input inf to directory location
+	// @@@TODO
+	{
+		char buffer[4096];
+		FILE* fd_input = fopen(inf_input_name, "r");
+		if (fd_input == NULL) {
+			wdi_err("could not open input inf file (%s)", inf_input_name);
+			r = WDI_ERROR_ACCESS;
+			goto out;
+		}
+
+		FILE* fd_output = fopen_as_userU(inf_path, "w");
+		if (fd_output == NULL) {
+			wdi_err("could not open output inf file (%s)", inf_path);
+			fclose(fd_input);
+			r = WDI_ERROR_ACCESS;
+			goto out;
+		}
+
+		size_t num;
+		while ((num = fread(buffer, 1, sizeof(buffer), fd_input)) > 0)
+			fwrite(buffer, 1, num, fd_output);
+
+		fclose(fd_input);
+		fclose(fd_output);
+	}
+
+	static_strcpy(inf_entities[INF_FILENAME].replace, inf_name);
+	cat_name = safe_strdup(inf_name);
+	if (cat_name == NULL) {
+		r = WDI_ERROR_RESOURCE;
+		goto out;
+	}
+	cat_name[safe_strlen(inf_name)-3] = 'c';
+	cat_name[safe_strlen(inf_name)-2] = 'a';
+	cat_name[safe_strlen(inf_name)-1] = 't';
+	static_strcpy(inf_entities[CAT_FILENAME].replace, cat_name);
+	safe_free(cat_name);
+
+	// Populate the Device Description and Hardware ID
+	static_strcpy(inf_entities[DEVICE_DESCRIPTION].replace, device_info->desc);
+	if ((options != NULL) && (options->use_wcid_driver)) {
+		static_strcpy(inf_entities[DEVICE_HARDWARE_ID].replace, ms_compat_id[driver_type]);
+		static_strcpy(inf_entities[USE_DEVICE_INTERFACE_GUID].replace, "NoDeviceInterfaceGUID");
+	} else {
+		if (device_info->is_composite) {
+			static_sprintf(inf_entities[DEVICE_HARDWARE_ID].replace, "VID_%04X&PID_%04X&MI_%02X",
+				device_info->vid, device_info->pid, device_info->mi);
+		} else {
+			static_sprintf(inf_entities[DEVICE_HARDWARE_ID].replace, "VID_%04X&PID_%04X",
+				device_info->vid, device_info->pid);
+		}
+		static_strcpy(inf_entities[USE_DEVICE_INTERFACE_GUID].replace, "AddDeviceInterfaceGUID");
+	}
+
+	// Find out if we have an Android device
+	for (i=0; i<ARRAYSIZE(android_device); i++) {
+		if ((android_device[i].vid == device_info->vid) && (android_device[i].pid == device_info->pid)) {
+			is_android_device = TRUE;
+			break;
+		}
+	}
+
+	// Populate the Device Interface GUID
+	if ((options != NULL) && (options->use_wcid_driver)) {
+		strguid = "UNUSED";
+	} else if ((options != NULL) && (options->device_guid != NULL)) {
+		strguid = options->device_guid;
+	} else if (is_android_device) {
+		wdi_info("Using Android Device Interface GUID");
+		strguid = (char*)android_device_guid;
+	} else {
+		IGNORE_RETVAL(CoCreateGuid(&guid));
+		strguid = guid_to_string(guid);
+	}
+	static_sprintf(inf_entities[DEVICE_INTERFACE_GUID].replace, "%s", strguid);
+
+	// Resolve the Manufacturer (Vendor Name)
+	if ((options != NULL) && (options->vendor_name != NULL)) {
+		static_strcpy(inf_entities[DEVICE_MANUFACTURER].replace, options->vendor_name);
+	} else {
+		vendor_name = wdi_get_vendor_name(device_info->vid);
+		if (vendor_name == NULL) {
+			vendor_name = "(Undefined Vendor)";
+		}
+		static_strcpy(inf_entities[DEVICE_MANUFACTURER].replace, vendor_name);
+	}
+
+	// Set the WDF and KMDF versions for WinUSB and libusbK
+	static_sprintf(inf_entities[WDF_VERSION].replace, "%05d", WDF_VER);
+	static_sprintf(inf_entities[KMDF_VERSION].replace, "%d.%d", WDF_VER/1000, WDF_VER%1000);
+
+	// Extra check, in case somebody modifies our code
+	if ((driver_type < 0) && (driver_type >= WDI_USER)) {
+		wdi_err("Program assertion failed - driver_version[] index out of range");
+		r = WDI_ERROR_OTHER;
+		goto out;
+	}
+
+	// Write the date and version data
+	file_time.dwHighDateTime = driver_version[driver_type].dwFileDateMS;
+	file_time.dwLowDateTime = driver_version[driver_type].dwFileDateLS;
+	if ( ((file_time.dwHighDateTime == 0) && (file_time.dwLowDateTime == 0))
+	  || (!FileTimeToLocalFileTime(&file_time, &local_time))
+	  || (!FileTimeToSystemTime(&local_time, &system_time)) ) {
+		GetLocalTime(&system_time);
+	}
+	static_sprintf(inf_entities[DRIVER_DATE].replace,
+		"%02d/%02d/%04d", system_time.wMonth, system_time.wDay, system_time.wYear);
+	static_sprintf(inf_entities[DRIVER_VERSION].replace, "%d.%d.%d.%d",
+		(int)driver_version[driver_type].dwFileVersionMS>>16, (int)driver_version[driver_type].dwFileVersionMS&0xFFFF,
+		(int)driver_version[driver_type].dwFileVersionLS>>16, (int)driver_version[driver_type].dwFileVersionLS&0xFFFF);
+
+	// Tokenize the file
+	if ((inf_file_size = tokenize_internal(inf_template[driver_type],
+		&dst, inf_entities, "#", "#", 0)) > 0) {
+#if 0
+		fd = fopen_as_userU(inf_path, "w");
+		if (fd == NULL) {
+			wdi_err("Failed to create file: %s", inf_path);
+			r = WDI_ERROR_ACCESS;
+			goto out;
+		}
+#endif
+		// Converting to UTF-16 is the only way to get devices using a
+		// non-English locale to display properly in device manager. UTF-8 will not do.
+		wdst = utf8_to_wchar(dst);
+		if (wdst == NULL) {
+			wdi_err("Could not convert '%s' to UTF-16", dst);
+			safe_free(dst);
+			r = WDI_ERROR_RESOURCE;
+			goto out;
+		}
+#if 0
+		fwrite(&bom, 2, 1, fd);	// Write the BOM
+		fwrite(wdst, 2, wcslen(wdst), fd);
+		fclose(fd);
+#endif
+		safe_free(wdst);
+		safe_free(dst);
+	} else {
+		wdi_err("Could not tokenize inf file (%d)", inf_file_size);
+		r = WDI_ERROR_ACCESS;
+		goto out;
+	}
+	wdi_info("Successfully created '%s'", inf_path);
+
+	if (IsUserAnAdmin()) {
+		// Try to create and self-sign the cat file to remove security prompts
+		if ((options != NULL) && (options->disable_cat)) {
+			wdi_info(".cat generation disabled by user");
+			r = WDI_SUCCESS;
+			goto out;
+		}
+		wdi_info("Creating and self-signing a .cat file...");
+
+		// Tokenize the cat file (for WDF version)
+		if ((cat_file_size = tokenize_internal(cat_template[driver_type],
+			&dst, inf_entities, "#", "#", 0)) <= 0) {
+			wdi_err("Could not tokenize cat file (%d)", cat_file_size);
+			r = WDI_ERROR_ACCESS;
+			goto out;
+		}
+
+		// Build the filename list
+		nb_entries = 0;
+		token = strtok(dst, "\n\r");
+		do {
+			// Eliminate leading, trailing spaces & comments (#...)
+			while (isspace(*token)) token++;
+			while (strlen(token) && isspace(token[strlen(token)-1]))
+				token[strlen(token)-1] = 0;
+			if ((*token == '#') || (*token == 0))
+				continue;
+			cat_list[nb_entries++] = token;
+			if (nb_entries >= CAT_LIST_MAX_ENTRIES) {
+				wdi_warn("More than %d cat entries - ignoring the rest", CAT_LIST_MAX_ENTRIES);
+				break;
+			}
+		} while ((token = strtok(NULL, "\n\r")) != NULL);
+
+		// Add the inf name to our list
+		cat_list[nb_entries++] = inf_name;
+
+		// the DEVICE_HARDWARE_ID is either "VID_####&PID_####[&MI_##]" or the MS Compatible ID
+		static_sprintf(hw_id, "USB\\%s", ((options != NULL) && (options->use_wcid_driver))?
+			ms_compat_id[driver_type]:inf_entities[DEVICE_HARDWARE_ID].replace);
+		static_sprintf(cert_subject, "CN=%s (libwdi autogenerated)", hw_id);
+
+		// Check if testsigning is enabled
+		// https://social.msdn.microsoft.com/Forums/Windowsapps/en-US/e6c1be93-7003-4594-b8e4-18ab4a75d273/detecting-testsigning-onoff-via-api
+		sci.Length = sizeof(sci);
+		if (NtQuerySystemInformation((SYSTEM_INFORMATION_CLASS)0x67, &sci, sizeof(sci), &dwcbSz) >= 0 && dwcbSz == sizeof(sci))
+			is_test_signing_enabled = !!(sci.CodeIntegrityOptions & 0x02);
+		wdi_info("Test signing is: %s", is_test_signing_enabled ? "Enabled" : "Disabled");
+
+		// Failures on the following are fatal on Windows 10 when test signing is not enabled
+		if (!CreateCat(cat_path, hw_id, drv_path, cat_list, nb_entries)) {
+			if (nWindowsVersion >= WINDOWS_10 && !is_test_signing_enabled) {
+				wdi_err("Could not create cat file");
+				return WDI_ERROR_CAT_MISSING;
+			}
+			wdi_warn("Could not create cat file");
+		} else if ((options != NULL) && (!options->disable_signing) && (!SelfSignFile(cat_path,
+			(options->cert_subject != NULL)?options->cert_subject:cert_subject))) {
+			if (nWindowsVersion >= WINDOWS_10 && !is_test_signing_enabled) {
+				wdi_err("Could not sign cat file");
+				return WDI_ERROR_UNSIGNED;
+			}
+			wdi_warn("Could not sign cat file");
+		}
+		safe_free(cat_in_copy);
+		safe_free(dst);
+	} else {
+		wdi_info("No .cat file generated (missing elevated privileges)");
+	}
+	r = WDI_SUCCESS;
+
+out:
+	CloseHandle(mutex);
+	return r;
+}
+
 // Handle messages received from the elevated installer through the pipe
 static int process_message(char* buffer, DWORD size)
 {
